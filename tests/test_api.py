@@ -2136,3 +2136,297 @@ def test_selection_preview_rejects_non_positive_integer_times(client, times):
     r = selection_preview(client, [{"batch_id": s1, "times": times}])
     assert r.status_code == 422
 
+
+# --------------------------------------------------------------------------- #
+# POST/GET /batches/{id}/seal + /unseal 原始样本质量封存
+# --------------------------------------------------------------------------- #
+
+
+def seal(client, sample_id, reason="留样复检待定"):
+    return client.post(f"/batches/{sample_id}/seal", json={"reason": reason})
+
+
+def unseal(client, sample_id, reason="复检合格放行"):
+    return client.post(f"/batches/{sample_id}/unseal", json={"reason": reason})
+
+
+def get_seal(client, sample_id):
+    return client.get(f"/batches/{sample_id}/seal")
+
+
+def test_seal_and_query_state_and_events(client):
+    s1 = make_sample(client, "S1")
+    # 初始未封存：sealed=false，无原因/时间，历史为空
+    r = get_seal(client, s1)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["sample_id"] == s1
+    assert body["sample_name"] == "S1"
+    assert body["sealed"] is False
+    assert body["reason"] is None
+    assert body["sealed_at"] is None
+    assert body["events"] == []
+
+    r = seal(client, s1, "留样复检")
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["sealed"] is True
+    assert body["reason"] == "留样复检"
+    assert isinstance(body["sealed_at"], str) and body["sealed_at"]
+    assert [(e["action"], e["reason"]) for e in body["events"]] == [
+        ("seal", "留样复检")]
+    assert body["events"][0]["created_at"]
+
+    # GET 查询与 POST 返回一致
+    assert get_seal(client, s1).json() == body
+
+
+def test_unseal_records_event_and_allows_reseal(client):
+    s1 = make_sample(client, "S1")
+    seal(client, s1, "原因A")
+    r = unseal(client, s1, "原因B")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["sealed"] is False
+    assert body["reason"] is None
+    assert body["sealed_at"] is None
+    # 每次状态变更的原因与时间都保留在历史中
+    assert [(e["action"], e["reason"]) for e in body["events"]] == [
+        ("seal", "原因A"), ("unseal", "原因B")]
+    assert all(e["created_at"] for e in body["events"])
+
+    # 解除后可再次封存，历史继续追加
+    assert seal(client, s1, "原因C").status_code == 201
+    body = get_seal(client, s1).json()
+    assert body["sealed"] is True
+    assert body["reason"] == "原因C"
+    assert [(e["action"], e["reason"]) for e in body["events"]] == [
+        ("seal", "原因A"), ("unseal", "原因B"), ("seal", "原因C")]
+
+
+def test_repeated_same_state_returns_409_and_changes_nothing(client):
+    s1 = make_sample(client, "S1")
+    # 未封存时解除 → 409
+    r = unseal(client, s1)
+    assert r.status_code == 409
+    assert "未处于封存状态" in r.json()["detail"]
+    assert get_seal(client, s1).json()["events"] == []
+
+    assert seal(client, s1).status_code == 201
+    # 已封存再封存 → 409，状态与历史不变
+    r = seal(client, s1, "重复封存")
+    assert r.status_code == 409
+    assert "已处于封存状态" in r.json()["detail"]
+    body = get_seal(client, s1).json()
+    assert body["sealed"] is True
+    assert len(body["events"]) == 1
+
+    # 解除后再次解除 → 409
+    assert unseal(client, s1).status_code == 200
+    assert unseal(client, s1).status_code == 409
+    assert len(get_seal(client, s1).json()["events"]) == 2
+
+
+def test_seal_unknown_batch_and_pool_rejected(client):
+    s1 = make_sample(client, "S1")
+    p1 = make_pool(client, "P1", [{"batch_id": s1, "portions": 1}])
+    # 未知批次 → 400
+    for resp in (seal(client, 4242), unseal(client, 4242), get_seal(client, 4242)):
+        assert resp.status_code == 400
+        assert "4242" in resp.json()["detail"]
+    # 混样批次不能封存 → 400
+    for resp in (seal(client, p1), unseal(client, p1), get_seal(client, p1)):
+        assert resp.status_code == 400
+        assert "原始样本" in resp.json()["detail"]
+
+
+def test_seal_requires_nonempty_reason(client):
+    s1 = make_sample(client, "S1")
+    assert client.post(f"/batches/{s1}/seal", json={}).status_code == 422
+    assert client.post(f"/batches/{s1}/seal", json={"reason": ""}).status_code == 422
+    assert client.post(f"/batches/{s1}/unseal", json={}).status_code == 422
+    assert client.post(f"/batches/{s1}/unseal", json={"reason": ""}).status_code == 422
+    # 校验失败不产生任何状态变更
+    assert get_seal(client, s1).json()["events"] == []
+
+
+def test_sealed_sample_blocks_single_preparation(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    add_inventory(client, s1, 10)
+    add_inventory(client, s2, 10)
+    seal(client, s1, "复检")
+
+    before_s1 = get_inventory(client, s1).json()
+    before_s2 = get_inventory(client, s2).json()
+    r = prepare(client, p1, 1)
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert [x["sample_id"] for x in detail["sealed_samples"]] == [s1]
+    assert detail["sealed_samples"][0]["sample_name"] == "S1"
+    assert detail["sealed_samples"][0]["reason"] == "复检"
+    # 整次请求不扣库存、不写制备记录
+    assert get_inventory(client, s1).json() == before_s1
+    assert get_inventory(client, s2).json() == before_s2
+    assert client.get("/preparations/1").status_code == 404
+
+    # 解除封存后可再次制备
+    assert unseal(client, s1).status_code == 200
+    assert prepare(client, p1, 1).status_code == 201
+    assert get_inventory(client, s1).json()["balance"] == 9
+
+
+def test_sealed_upstream_sample_blocks_nested_preparation(client):
+    # 沿配方图识别间接上游：P2 = P1 + S3，P1 = S1 + S2；封存 S1 拦截 P2 制备
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    p2 = make_pool(client, "P2", [
+        {"batch_id": p1, "portions": 1}, {"batch_id": s3, "portions": 1}])
+    for s in (s1, s2, s3):
+        add_inventory(client, s, 10)
+    seal(client, s1)
+
+    r = prepare(client, p2, 1)
+    assert r.status_code == 409
+    assert [x["sample_id"] for x in r.json()["detail"]["sealed_samples"]] == [s1]
+    # 全部样本余额不变、无制备记录
+    for s in (s1, s2, s3):
+        assert get_inventory(client, s).json()["balance"] == 10
+    assert client.get("/preparations/1").status_code == 404
+
+
+def test_sealed_sample_target_itself_blocked(client):
+    # 原始样本作为制备目标（消耗自身）同样被拦截
+    s1 = make_sample(client, "S1")
+    add_inventory(client, s1, 5)
+    seal(client, s1)
+    r = prepare(client, s1, 1)
+    assert r.status_code == 409
+    assert [x["sample_id"] for x in r.json()["detail"]["sealed_samples"]] == [s1]
+    assert get_inventory(client, s1).json()["balance"] == 5
+
+
+def test_multiple_sealed_samples_listed_in_409(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    add_inventory(client, s1, 10)
+    add_inventory(client, s2, 10)
+    seal(client, s2, "R2")
+    seal(client, s1, "R1")
+
+    r = prepare(client, p1, 1)
+    assert r.status_code == 409
+    sealed = r.json()["detail"]["sealed_samples"]
+    # 样本 id 清单按升序返回，各带封存原因与时间
+    assert [x["sample_id"] for x in sealed] == [s1, s2]
+    assert [x["reason"] for x in sealed] == ["R1", "R2"]
+    assert all(x["sealed_at"] for x in sealed)
+
+
+def test_sealed_sample_blocks_preparation_job(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [{"batch_id": s1, "portions": 1}])
+    add_inventory(client, s1, 10)
+    add_inventory(client, s2, 10)
+    seal(client, s1, "复检")
+
+    r = prepare_job(client, [{"batch_id": p1, "times": 1}, {"batch_id": s2, "times": 1}])
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert [x["sample_id"] for x in detail["sealed_samples"]] == [s1]
+    # 整单不留记录、余额不变
+    assert get_inventory(client, s1).json()["balance"] == 10
+    assert get_inventory(client, s2).json()["balance"] == 10
+    assert client.get("/preparations/1").status_code == 404
+
+    # 解除封存后整单可原样重试成功
+    assert unseal(client, s1).status_code == 200
+    assert prepare_job(client, [
+        {"batch_id": p1, "times": 1}, {"batch_id": s2, "times": 1}]).status_code == 201
+    assert get_inventory(client, s1).json()["balance"] == 9
+    assert get_inventory(client, s2).json()["balance"] == 9
+
+
+def test_seal_does_not_affect_inventory_topup_and_query(client):
+    s1 = make_sample(client, "S1")
+    add_inventory(client, s1, 5)
+    assert seal(client, s1).status_code == 201
+    # 封存只拦截制备：库存查询与补入照常
+    assert get_inventory(client, s1).json()["balance"] == 5
+    assert add_inventory(client, s1, 3).status_code == 200
+    assert get_inventory(client, s1).json()["balance"] == 8
+
+
+def test_seal_does_not_affect_history_preparation_query_and_reversal(client):
+    s1 = make_sample(client, "S1")
+    p1 = make_pool(client, "P1", [{"batch_id": s1, "portions": 1}])
+    add_inventory(client, s1, 5)
+    prep = prepare(client, p1, 2)
+    assert prep.status_code == 201
+    prep_id = prep.json()["id"]
+    assert get_inventory(client, s1).json()["balance"] == 3
+
+    assert seal(client, s1).status_code == 201
+    # 已有历史制备记录仍可查询
+    r = client.get(f"/preparations/{prep_id}")
+    assert r.status_code == 200
+    assert r.json()["consumptions"] == prep.json()["consumptions"]
+    # 仍可冲正：按已保存明细返还库存
+    assert reverse_preparation(client, prep_id).status_code == 201
+    assert get_inventory(client, s1).json()["balance"] == 5
+    # 冲正返还后样本仍被封存：新的制备仍被拦截
+    assert prepare(client, p1, 1).status_code == 409
+    # 解除封存后可再次制备
+    assert unseal(client, s1).status_code == 200
+    assert prepare(client, p1, 1).status_code == 201
+
+
+def test_concurrent_seal_and_preparation_serialize(client):
+    # 并发封存与制备：结果只能是“制备先提交→201”或“封存先提交→409”，
+    # 不允许封存已生效却漏拦（409 之后不能再出现 201）
+    s1 = make_sample(client, "S1")
+    p1 = make_pool(client, "P1", [{"batch_id": s1, "portions": 1}])
+    add_inventory(client, s1, 10)
+    barrier = threading.Barrier(4)
+    lock = threading.Lock()
+    prep_codes: list[int] = []
+    seal_code: dict[str, int] = {}
+
+    def do_seal():
+        barrier.wait()
+        r = seal(client, s1)
+        seal_code["status"] = r.status_code
+
+    def do_prepare():
+        barrier.wait()
+        r = prepare(client, p1, 1)
+        with lock:  # 按实际完成时间记录
+            prep_codes.append(r.status_code)
+
+    threads = [threading.Thread(target=do_seal)]
+    threads += [threading.Thread(target=do_prepare) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert seal_code["status"] == 201
+    assert set(prep_codes) <= {201, 409}, prep_codes
+    assert len(prep_codes) == 3
+    # 写事务串行化后结果只能呈“若干 201 后全为 409”的单调形态
+    first_reject = next((i for i, c in enumerate(prep_codes) if c == 409), None)
+    if first_reject is not None:
+        assert all(c == 409 for c in prep_codes[first_reject:])
+    # 最终处于封存状态；消耗份数与成功记录数一致
+    assert get_seal(client, s1).json()["sealed"] is True
+    succeeded = prep_codes.count(201)
+    assert get_inventory(client, s1).json()["balance"] == 10 - succeeded
+

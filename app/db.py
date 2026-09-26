@@ -60,6 +60,24 @@ CREATE TABLE IF NOT EXISTS preparation_reversals (
     preparation_id INTEGER PRIMARY KEY REFERENCES preparations (id),
     reversed_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+CREATE TABLE IF NOT EXISTS sample_seals (
+    -- 原始样本质量封存：存在该行即表示当前处于封存状态（主键天然阻止重复封存）；
+    -- 解除封存删除该行；每次状态变更的原因与时间见 sample_seal_events
+    sample_id INTEGER PRIMARY KEY REFERENCES batches (id),
+    reason    TEXT NOT NULL,
+    sealed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS sample_seal_events (
+    -- 封存状态变更历史：每次封存/解除各追加一行（动作 + 原因 + 时间），只增不改；
+    -- 解除封存后历史仍可查；与 sample_seals 在同一写事务内维护
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id  INTEGER NOT NULL REFERENCES batches (id),
+    action     TEXT NOT NULL CHECK (action IN ('seal', 'unseal')),
+    reason     TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 """
 
 

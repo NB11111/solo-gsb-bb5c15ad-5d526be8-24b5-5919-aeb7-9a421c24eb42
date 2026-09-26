@@ -13,8 +13,11 @@
 - POST /batches/{batch_id}/portion-diagnosis 份数诊断：假设仅一项份数记错，反推正整数份数（不写库）
 - POST /batches/{batch_id}/inventory   为原始样本补入正整数份库存（累加）
 - GET  /batches/{batch_id}/inventory   查询原始样本库存余额
-- POST /batches/{batch_id}/preparations 批次制备：正整数次数，沿配方图整数消耗原始样本库存（不足 409 且整体回滚）
-- POST /preparation-jobs               整单制备：多批次清单合并核算，按样本汇总需求一次扣减（不足 409 且整单回滚）
+- POST /batches/{batch_id}/seal        封存原始样本（必填原因；已封存重复操作返回 409）
+- POST /batches/{batch_id}/unseal      解除原始样本封存（必填原因；未封存重复操作返回 409）
+- GET  /batches/{batch_id}/seal        查询原始样本封存状态与全部状态变更历史（原因 + 时间）
+- POST /batches/{batch_id}/preparations 批次制备：正整数次数，沿配方图整数消耗原始样本库存（不足 409 且整体回滚；命中封存样本 409）
+- POST /preparation-jobs               整单制备：多批次清单合并核算，按样本汇总需求一次扣减（不足 409 且整单回滚；命中封存样本 409）
 - POST /preparation-jobs/selection-preview 只读排产预演：1～12 条候选制备单按同一库存快照选型（不扣库存、不写记录）
 - GET  /preparations/{preparation_id}  按记录 id 查询制备记录（含消耗明细与当前剩余库存）
 - POST /preparations/{preparation_id}/reversal 制备记录冲正：按已保存消耗明细逐样本返还库存（重复冲正幂等，未知记录 404）
@@ -64,6 +67,9 @@ from .schemas import (
     RecipePreviewOut,
     RecipePreviewRequest,
     SampleCreate,
+    SealEventOut,
+    SealRequest,
+    SampleSealOut,
     SelectionPreviewOut,
     SelectionPreviewRequest,
 )
@@ -799,6 +805,178 @@ def get_inventory(
     return _inventory_out(conn, inv)
 
 
+def _fetch_sample_for_seal(conn: sqlite3.Connection, batch_id: int) -> sqlite3.Row:
+    """封存操作的公共校验：仅已存在的原始样本可封存/查询（与库存端点同一约定）。"""
+    row = _fetch_batch(conn, batch_id)
+    if row is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {batch_id}")
+    if row["kind"] != "sample":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"只有原始样本可封存（kind='sample'）: {batch_id}",
+        )
+    return row
+
+
+def _build_seal_out(conn: sqlite3.Connection, sample_id: int) -> SampleSealOut:
+    """组装封存状态响应：当前状态 + 全部状态变更历史（按发生先后升序）。"""
+    seal = conn.execute(
+        "SELECT reason, sealed_at FROM sample_seals WHERE sample_id = ?", (sample_id,)
+    ).fetchone()
+    events = conn.execute(
+        """
+        SELECT action, reason, created_at FROM sample_seal_events
+        WHERE sample_id = ? ORDER BY id
+        """,
+        (sample_id,),
+    ).fetchall()
+    name = conn.execute(
+        "SELECT name FROM batches WHERE id = ?", (sample_id,)
+    ).fetchone()["name"]
+    return SampleSealOut(
+        sample_id=sample_id,
+        sample_name=name,
+        sealed=seal is not None,
+        reason=seal["reason"] if seal is not None else None,
+        sealed_at=seal["sealed_at"] if seal is not None else None,
+        events=[
+            SealEventOut(action=e["action"], reason=e["reason"], created_at=e["created_at"])
+            for e in events
+        ],
+    )
+
+
+@app.post(
+    "/batches/{batch_id}/seal",
+    response_model=SampleSealOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="封存原始样本（记录原因；已封存重复操作返回 409）",
+)
+def seal_sample(
+    batch_id: int,
+    payload: SealRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> SampleSealOut:
+    _fetch_sample_for_seal(conn, batch_id)
+
+    # 状态判重、当前状态写入与历史追加在同一 SQLite 写事务内完成：
+    # BEGIN IMMEDIATE 立即取写锁，与制备核算相互串行——封存一旦提交，
+    # 随后的制备事务必然读到封存行，不会漏拦
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT 1 FROM sample_seals WHERE sample_id = ?", (batch_id,)
+        ).fetchone()
+        if existing is not None:
+            # 同一状态重复操作：返回冲突，不追加历史
+            conn.rollback()
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail=f"原始样本已处于封存状态: {batch_id}",
+            )
+        conn.execute(
+            "INSERT INTO sample_seals (sample_id, reason) VALUES (?, ?)",
+            (batch_id, payload.reason),
+        )
+        conn.execute(
+            "INSERT INTO sample_seal_events (sample_id, action, reason) VALUES (?, 'seal', ?)",
+            (batch_id, payload.reason),
+        )
+        conn.commit()
+    except HTTPException:
+        raise
+    return _build_seal_out(conn, batch_id)
+
+
+@app.post(
+    "/batches/{batch_id}/unseal",
+    response_model=SampleSealOut,
+    summary="解除原始样本封存（记录原因；未封存重复操作返回 409）",
+)
+def unseal_sample(
+    batch_id: int,
+    payload: SealRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> SampleSealOut:
+    _fetch_sample_for_seal(conn, batch_id)
+
+    # 与封存同一事务模型：判重、删除当前状态、追加历史在同一写事务内完成
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT 1 FROM sample_seals WHERE sample_id = ?", (batch_id,)
+        ).fetchone()
+        if existing is None:
+            # 同一状态重复操作：返回冲突，不追加历史
+            conn.rollback()
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail=f"原始样本未处于封存状态: {batch_id}",
+            )
+        conn.execute("DELETE FROM sample_seals WHERE sample_id = ?", (batch_id,))
+        conn.execute(
+            "INSERT INTO sample_seal_events (sample_id, action, reason) VALUES (?, 'unseal', ?)",
+            (batch_id, payload.reason),
+        )
+        conn.commit()
+    except HTTPException:
+        raise
+    return _build_seal_out(conn, batch_id)
+
+
+@app.get(
+    "/batches/{batch_id}/seal",
+    response_model=SampleSealOut,
+    summary="查询原始样本封存状态与全部状态变更历史",
+)
+def get_sample_seal(
+    batch_id: int, conn: sqlite3.Connection = Depends(get_db)
+) -> SampleSealOut:
+    _fetch_sample_for_seal(conn, batch_id)
+    return _build_seal_out(conn, batch_id)
+
+
+def _ensure_no_sealed_samples(conn: sqlite3.Connection, sample_ids: list[int]) -> None:
+    """在同一写事务内检查上游原始样本的封存状态。
+
+    任一样本被封存即回滚当前事务并抛 409：detail.sealed_samples 按样本 id 升序
+    给出每个被封存样本的 id、名称、封存原因与封存时间；全部未封存时不做任何
+    修改、直接返回。与制备核算共处同一 SQLite 写事务（BEGIN IMMEDIATE）：
+    并发封存一旦提交，随后的制备事务必然读到封存行，不会漏拦。
+    """
+    if not sample_ids:
+        return
+    rows = conn.execute(
+        """
+        SELECT ss.sample_id, b.name AS sample_name, ss.reason, ss.sealed_at
+        FROM sample_seals ss
+        JOIN batches b ON b.id = ss.sample_id
+        WHERE ss.sample_id IN (%s)
+        ORDER BY ss.sample_id
+        """
+        % ", ".join("?" for _ in sample_ids),
+        sample_ids,
+    ).fetchall()
+    if not rows:
+        return
+    conn.rollback()
+    raise HTTPException(
+        status.HTTP_409_CONFLICT,
+        detail={
+            "message": "制备命中被封存的原始样本",
+            "sealed_samples": [
+                {
+                    "sample_id": r["sample_id"],
+                    "sample_name": r["sample_name"],
+                    "reason": r["reason"],
+                    "sealed_at": r["sealed_at"],
+                }
+                for r in rows
+            ],
+        },
+    )
+
+
 def _build_preparation_out(
     conn: sqlite3.Connection, prep: sqlite3.Row
 ) -> PreparationOut:
@@ -898,7 +1076,7 @@ def _ensure_inventory(conn: sqlite3.Connection, required: dict[int, int]) -> Non
     "/batches/{batch_id}/preparations",
     response_model=PreparationOut,
     status_code=status.HTTP_201_CREATED,
-    summary="批次制备：按配方整数消耗原始样本库存（同一事务核算与扣减）",
+    summary="批次制备：按配方整数消耗原始样本库存（同一事务核算与扣减；命中封存样本 409）",
 )
 def create_preparation(
     batch_id: int,
@@ -911,13 +1089,18 @@ def create_preparation(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {batch_id}")
 
     # 核算与扣减必须在同一 SQLite 写事务内完成：BEGIN IMMEDIATE 取写锁，
-    # 余额读取、缺口核算、库存扣减与制备记录写入彼此原子，并发制备相互串行
+    # 封存检查、余额读取、缺口核算、库存扣减与制备记录写入彼此原子，
+    # 并发制备与并发封存/解封相互串行
     conn.execute("BEGIN IMMEDIATE")
     try:
         # 沿配方图逐层乘算、多路径合并，得到各原始样本的整数需求；
         # 原始样本目标直接消耗自身（每制备一次 1 份）
         required = preparation_requirements(conn, batch_id, payload.times)
         sample_ids = sorted(required)
+
+        # 任一上游原始样本（含嵌套、多路径可达）被封存即整体回滚：
+        # 库存与制备记录均不变化；解除封存后可再次制备
+        _ensure_no_sealed_samples(conn, sample_ids)
 
         # 任一样本库存不足即整体回滚：库存与制备记录均不变化
         _ensure_inventory(conn, required)
@@ -1098,7 +1281,7 @@ def get_preparation_reversal(
     "/preparation-jobs",
     response_model=PreparationJobOut,
     status_code=status.HTTP_201_CREATED,
-    summary="整单制备：多批次清单合并核算，按样本汇总需求一次扣减（不足 409 且整单回滚）",
+    summary="整单制备：多批次清单合并核算，按样本汇总需求一次扣减（不足或命中封存样本 409 且整单回滚）",
 )
 def create_preparation_job(
     payload: PreparationJobCreateRequest,
@@ -1132,6 +1315,9 @@ def create_preparation_job(
         for batch_id in ids:
             for sample_id, portions in per_batch[batch_id].items():
                 total[sample_id] = total.get(sample_id, 0) + portions
+
+        # 任一上游原始样本被封存：整单回滚，不留任何制备记录、余额不变
+        _ensure_no_sealed_samples(conn, sorted(total))
 
         # 任一样本不足：整单回滚，不留任何制备记录、余额不变
         _ensure_inventory(conn, total)

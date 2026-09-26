@@ -226,6 +226,29 @@ class InventoryOut(BaseModel):
     updated_at: str | None = None  # 最近一次补入时间；从未补入时为 null
 
 
+class SealRequest(BaseModel):
+    """封存/解除封存的原因（必填，随状态变更历史一并保存）。"""
+
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+
+
+class SealEventOut(BaseModel):
+    """一次封存状态变更（封存或解除），含原因与时间。"""
+
+    action: Literal["seal", "unseal"]
+    reason: str
+    created_at: str
+
+
+class SampleSealOut(BaseModel):
+    sample_id: int
+    sample_name: str
+    sealed: bool                  # 当前是否处于封存状态
+    reason: str | None = None     # 当前封存原因；未封存为 null
+    sealed_at: str | None = None  # 当前封存时间；未封存为 null
+    events: list[SealEventOut]    # 全部状态变更历史，按发生先后升序
+
+
 class PreparationCreateRequest(BaseModel):
     """批次制备：正整数制备次数（每制备一次按配方消耗一批）。"""
 

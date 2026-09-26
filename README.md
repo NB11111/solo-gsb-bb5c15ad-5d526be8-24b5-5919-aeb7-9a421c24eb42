@@ -14,6 +14,7 @@
 - **配方变更影响预演**：提交完整替代配方，在内存中演算目标批次及全部下游批次各原始样本的原占比、预演占比与有符号差值，**不修改数据库**
 - **份数诊断**：假设混样配方仅一项投入份数记错，按实测原始样本占比用有理数方程反推该项的正整数份数，并用全部样本占比复核；份数变化不改变组成且与实测吻合的项列为**无法判定**；**不修改数据库**
 - **原始样本库存与批次制备**：可为已有原始样本补入**正整数份**库存并查询余额；`POST /batches/{id}/preparations` 按**正整数次数**制备批次，每制备一次混样按其配方消耗相应份数的上游批次，沿配方图逐层乘算、多路径需求合并为各原始样本的**整数消耗**（原始样本目标直接消耗自身）；核算与扣减在**同一 SQLite 写事务**内完成，任一样本库存不足即返回 **409** 与各样缺口、库存与制备记录均不变化，足量时一次扣减并保存目标批次、次数与消耗明细，可按记录 id 查询
+- **原始样本质量封存**：`POST /batches/{id}/seal` 封存原始样本、`POST /batches/{id}/unseal` 解除封存（均必填**原因**），`GET /batches/{id}/seal` 查询当前封存状态与**全部状态变更历史**（每次封存/解除的原因与时间）；仅原始样本可封存，**同一状态重复操作返回 409**；单批次制备与整单制备沿配方图识别全部被封存的上游原始样本，命中即返回**样本 id 清单与 409**，整次请求不扣库存、不写制备记录，解除封存后可再次制备；封存状态变更与制备核算使用**同一 SQLite 写事务**串行化，并发不漏拦；已有历史制备记录仍可查询和冲正
 - **整单制备**：`POST /preparation-jobs` 一次接收**非空制备清单**（每项为已有批次 id + 正整数制备次数），同一批次重复出现时先**合并次数**；先沿配方图计算每项对原始样本的整数需求，再**按样本汇总整单需求**统一核算（共享样本不会被各项分别判为足量）；读取余额、核算缺口、扣减库存与写入各批次制备记录在**同一写事务**完成，任一样本不足返回包含该样本**总需求、余额与缺口**的 **409**、整单不留记录且余额不变；成功时返回各批次制备记录 id 与整单消耗，每条记录仍可由 `GET /preparations/{id}` 读取
 - **只读排产预演**：`POST /preparation-jobs/selection-preview` 接收 **1～12 条候选制备单**（每条为已有批次 id + 正整数次数，按请求位置标识订单，**允许重复批次**、不合并次数），复用配方图整数消耗展开计算每条订单对原始样本的需求，依据**同一库存快照**选出各样本总需求均不超过余额的子集——先**最大化入选订单数**，再**最大化入选制备次数之和**，仍并列时取**入选位置序列字典序最小**者；返回入选/未入选位置、按样本汇总的消耗与剩余库存，库存全不足时返回空集；**不扣减库存、不创建制备记录**
 - **制备记录冲正**：`POST /preparations/{id}/reversal` 对**存在且尚未冲正**的制备记录，按记录**已保存的消耗明细逐样本返还**原始样本库存，并保存与该记录**一一对应**的冲正时间；读取记录、判重、返还与保存在**同一 SQLite 写事务**内完成；**重复冲正幂等**返回同一冲正记录（200）且不再次返还，未知制备记录返回 **404**。`GET /preparations/{id}/reversal` 查询冲正时间、各样本返还份数与当前库存（明细按样本 id 升序），未冲正返回 **404**。单批制备与整单制备生成的记录均可冲正；冲正**不删改**原制备记录与消耗明细，`GET /preparations/{id}` 照常可查
@@ -64,8 +65,11 @@ docker compose up --build
 | `POST` | `/batches/{id}/portion-diagnosis` | 份数诊断：假设仅一项份数记错，反推正整数份数（不写库） |
 | `POST` | `/batches/{id}/inventory` | 为原始样本补入正整数份库存（累加） |
 | `GET` | `/batches/{id}/inventory` | 查询原始样本库存余额（未补入为 0） |
-| `POST` | `/batches/{id}/preparations` | 批次制备：按整数次数消耗原始样本库存（不足 409 且整体回滚） |
-| `POST` | `/preparation-jobs` | 整单制备：多批次清单合并次数、按样本汇总需求一次扣减（不足 409 且整单回滚） |
+| `POST` | `/batches/{id}/seal` | 封存原始样本（必填原因；已封存重复操作 409） |
+| `POST` | `/batches/{id}/unseal` | 解除原始样本封存（必填原因；未封存重复操作 409） |
+| `GET` | `/batches/{id}/seal` | 查询原始样本封存状态与全部状态变更历史（原因 + 时间） |
+| `POST` | `/batches/{id}/preparations` | 批次制备：按整数次数消耗原始样本库存（不足或命中封存样本 409 且整体回滚） |
+| `POST` | `/preparation-jobs` | 整单制备：多批次清单合并次数、按样本汇总需求一次扣减（不足或命中封存样本 409 且整单回滚） |
 | `POST` | `/preparation-jobs/selection-preview` | 只读排产预演：1～12 条候选制备单按同一库存快照选型（不扣库存、不写记录） |
 | `GET` | `/preparations/{id}` | 按记录 id 查询制备记录（消耗明细 + 当前剩余库存） |
 | `POST` | `/preparations/{id}/reversal` | 制备记录冲正：按已保存消耗明细逐样本返还库存（重复冲正幂等，未知记录 404） |
@@ -608,6 +612,64 @@ curl http://localhost:8000/preparations/999/reversal
 
 整单制备生成的多条记录可分别冲正：每条只按**自己的**消耗明细返还；整单中两条记录若消耗了同一个样本，两条各自冲正后该样本的两份返还都会加回。冲正不影响新的制备——库存返还后可用同一批次再次制备，新制备生成新的记录。
 
+### 14. 原始样本质量封存
+
+对**已存在的原始样本**执行质量封存：封存期间该样本（及其全部下游混样）不得用于新的制备，解除封存后恢复。封存/解除均**必填原因**，每次状态变更（动作 + 原因 + 时间）追加到变更历史，只增不改。
+
+- `POST /batches/{id}/seal`：封存原始样本，返回 **201** 与当前状态；`POST /batches/{id}/unseal`：解除封存，返回 **200** 与当前状态；
+- **仅原始样本可封存**：未知批次与混样批次均返回 **400**；原因为空或缺失返回 **422**；
+- **同一状态重复操作返回 409**：已封存再封存、未封存（或已解除）再解除，均返回 **409**，状态与历史不变；
+- `GET /batches/{id}/seal`：查询当前封存状态（`sealed`、`reason`、`sealed_at`）与**全部状态变更历史** `events`（按发生先后升序）。
+
+```bash
+curl -X POST http://localhost:8000/batches/1/seal \
+  -H 'Content-Type: application/json' -d '{"reason": "留样复检待定"}'
+```
+
+```json
+{
+  "sample_id": 1,
+  "sample_name": "S1",
+  "sealed": true,
+  "reason": "留样复检待定",
+  "sealed_at": "2026-09-26T09:00:00.000Z",
+  "events": [
+    {"action": "seal", "reason": "留样复检待定", "created_at": "2026-09-26T09:00:00.000Z"}
+  ]
+}
+```
+
+```bash
+curl -X POST http://localhost:8000/batches/1/unseal \
+  -H 'Content-Type: application/json' -d '{"reason": "复检合格放行"}'
+# 200：sealed=false，reason/sealed_at 为 null，events 追加一条 unseal 记录
+```
+
+**制备拦截**：单批次制备（`POST /batches/{id}/preparations`）与整单制备（`POST /preparation-jobs`）沿现有配方图识别**全部被封存的上游原始样本**——无论样本直接投入，还是经嵌套混样、多路径汇合间接可达（原始样本作为制备目标时检查其自身）。命中即返回 **409** 与按样本 id 升序的清单，`detail.sealed_samples` 给出每个被封存样本的 id、名称、封存原因与封存时间；**整次请求不扣库存、不写制备记录**，解除封存后可原样重试：
+
+```bash
+# S1 已封存，P2 = 1×P1 + 1×S1（P1 = 1×S1 + 1×S2），S1 经两条路径可达
+curl -X POST http://localhost:8000/batches/4/preparations \
+  -H 'Content-Type: application/json' -d '{"times": 1}'
+```
+
+```json
+{
+  "detail": {
+    "message": "制备命中被封存的原始样本",
+    "sealed_samples": [
+      {"sample_id": 1, "sample_name": "S1", "reason": "留样复检待定", "sealed_at": "2026-09-26T09:00:00.000Z"}
+    ]
+  }
+}
+```
+
+说明：
+
+- **并发串行化**：封存状态变更与制备核算使用**同一 SQLite 写事务**模型（`BEGIN IMMEDIATE` 立即取写锁）——封存一旦提交，随后的制备事务必然读到封存状态，不会漏拦；并发封存与制备的结果只能是“制备先提交成功”或“封存先提交、制备 409”；
+- **历史记录不受影响**：封存只拦截新的制备，已有制备记录仍可 `GET /preparations/{id}` 查询、仍可冲正（冲正按已保存明细返还库存，与当前封存状态无关）；封存也不影响库存的查询与补入；
+- 只读排产预演（`/preparation-jobs/selection-preview`）不扣库存、不写记录，不做封存拦截。
+
 ### 错误示例
 
 ```bash
@@ -728,6 +790,27 @@ curl http://localhost:8000/preparations/1/reversal
 
 # 重复冲正不报错：首次 201，再次冲正幂等返回 200 且不再返还库存
 curl -X POST http://localhost:8000/preparations/1/reversal
+
+# 封存未知批次或混样批次 → 400
+curl -X POST http://localhost:8000/batches/999/seal -H 'Content-Type: application/json' \
+  -d '{"reason": "复检"}'
+curl -X POST http://localhost:8000/batches/3/seal -H 'Content-Type: application/json' \
+  -d '{"reason": "复检"}'   # 3 为混样批次 id 时同样 400
+
+# 封存/解除缺少原因或原因为空 → 422
+curl -X POST http://localhost:8000/batches/1/seal -H 'Content-Type: application/json' \
+  -d '{"reason": ""}'
+
+# 同一状态重复操作 → 409（已封存再封存 / 未封存再解除）
+curl -X POST http://localhost:8000/batches/1/seal -H 'Content-Type: application/json' \
+  -d '{"reason": "复检"}'    # 已封存时 → 409 {"detail":"原始样本已处于封存状态: 1"}
+curl -X POST http://localhost:8000/batches/2/unseal -H 'Content-Type: application/json' \
+  -d '{"reason": "放行"}'    # 未封存时 → 409 {"detail":"原始样本未处于封存状态: 2"}
+
+# 制备命中被封存的上游原始样本 → 409（不扣库存、不写制备记录）
+curl -X POST http://localhost:8000/batches/4/preparations -H 'Content-Type: application/json' \
+  -d '{"times": 1}'
+# {"detail":{"message":"制备命中被封存的原始样本","sealed_samples":[{"sample_id":1,...}]}}
 ```
 
 ## 占比计算说明
@@ -751,12 +834,12 @@ pytest                                 # 运行测试（使用临时数据库，
 
 ```
 app/
-  main.py       # FastAPI 路由与请求处理（禁配规则、目标占比规划、配方预演、份数诊断、库存补入、批次制备、整单制备、只读排产预演与制备记录冲正端点）
-  db.py         # SQLite 连接与建表（启动时自动执行，含禁配规则、库存、制备记录与冲正记录表及写事务设置）
+  main.py       # FastAPI 路由与请求处理（禁配规则、目标占比规划、配方预演、份数诊断、库存补入、质量封存、批次制备、整单制备、只读排产预演与制备记录冲正端点）
+  db.py         # SQLite 连接与建表（启动时自动执行，含禁配规则、库存、封存状态与变更历史、制备记录与冲正记录表及写事务设置）
   schemas.py    # Pydantic 请求/响应模型（含严格正整数校验）
   service.py    # 递归占比计算、配方图可达原始样本、禁配补录影响预演、目标占比反算、配方预演、份数诊断、制备整数消耗与排产子集选型（Fraction 精确分数）
 tests/
-  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、份数诊断、禁配规则与补录影响预演、库存与制备扣减、整单制备、只读排产预演、制备冲正幂等与返还、并发与各类非法输入）
+  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、份数诊断、禁配规则与补录影响预演、库存与制备扣减、质量封存与制备拦截、整单制备、只读排产预演、制备冲正幂等与返还、并发与各类非法输入）
 Dockerfile
 docker-compose.yml
 requirements.txt
