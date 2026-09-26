@@ -13,6 +13,9 @@
 - POST /batches/{batch_id}/portion-diagnosis 份数诊断：假设仅一项份数记错，反推正整数份数（不写库）
 - POST /batches/{batch_id}/inventory   为原始样本补入正整数份库存（累加）
 - GET  /batches/{batch_id}/inventory   查询原始样本库存余额
+- POST /batches/{batch_id}/seal        封存原始样本（记录原因与时间，重复封存 409）
+- POST /batches/{batch_id}/unseal      解除原始样本封存（记录原因与时间，重复解除 409）
+- GET  /batches/{batch_id}/seal        查询封存状态与全部状态变更历史
 - POST /batches/{batch_id}/preparations 批次制备：正整数次数，沿配方图整数消耗原始样本库存（不足 409 且整体回滚）
 - POST /preparation-jobs               整单制备：多批次清单合并核算，按样本汇总需求一次扣减（不足 409 且整单回滚）
 - POST /preparation-jobs/selection-preview 只读排产预演：1～12 条候选制备单按同一库存快照选型（不扣库存、不写记录）
@@ -64,6 +67,9 @@ from .schemas import (
     RecipePreviewOut,
     RecipePreviewRequest,
     SampleCreate,
+    SealEventOut,
+    SealRequest,
+    SealStatusOut,
     SelectionPreviewOut,
     SelectionPreviewRequest,
 )
@@ -799,6 +805,160 @@ def get_inventory(
     return _inventory_out(conn, inv)
 
 
+def _build_seal_status_out(
+    conn: sqlite3.Connection, batch_id: int, sample_name: str
+) -> SealStatusOut:
+    """组装封存状态响应：当前状态 + 按时间（事件 id）升序的全部变更历史。
+
+    sample_seals 有行即封存中；sample_seal_events 是每次封存/解除的追加流水，
+    解除封存不删除历史。须在已读取到样本名称后调用。
+    """
+    seal = conn.execute(
+        "SELECT reason, sealed_at FROM sample_seals WHERE sample_id = ?", (batch_id,)
+    ).fetchone()
+    history = [
+        SealEventOut(action=r["action"], reason=r["reason"], created_at=r["created_at"])
+        for r in conn.execute(
+            """
+            SELECT action, reason, created_at FROM sample_seal_events
+            WHERE sample_id = ? ORDER BY id
+            """,
+            (batch_id,),
+        )
+    ]
+    return SealStatusOut(
+        sample_id=batch_id,
+        sample_name=sample_name,
+        sealed=seal is not None,
+        reason=seal["reason"] if seal is not None else None,
+        sealed_at=seal["sealed_at"] if seal is not None else None,
+        history=history,
+    )
+
+
+@app.post(
+    "/batches/{batch_id}/seal",
+    response_model=SealStatusOut,
+    summary="封存原始样本（记录原因与时间；仅原始样本可封存，重复封存 409）",
+)
+def seal_sample(
+    batch_id: int,
+    payload: SealRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> SealStatusOut:
+    # 未知批次 / 非原始样本沿用库存接口约定返回 400
+    row = _fetch_batch(conn, batch_id)
+    if row is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {batch_id}")
+    if row["kind"] != "sample":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"只有原始样本可封存（kind='sample'）: {batch_id}",
+        )
+
+    # 状态读取、变更与流水追加必须与制备核算共用同一个 SQLite 写事务模型：
+    # BEGIN IMMEDIATE 立即取写锁，封存提交后随后的制备必然读到封存状态，不会漏拦
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT reason, sealed_at FROM sample_seals WHERE sample_id = ?", (batch_id,)
+        ).fetchone()
+        if existing is not None:
+            # 同一状态重复操作：不新增流水，返回 409（不幂等）
+            conn.rollback()
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "message": "原始样本已处于封存状态",
+                    "sealed_samples": [batch_id],
+                },
+            )
+        conn.execute(
+            """
+            INSERT INTO sample_seals (sample_id, reason, sealed_at)
+            VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            """,
+            (batch_id, payload.reason),
+        )
+        # 封存行与流水行共用同一时间戳，保证响应中 sealed_at 与首条历史一致
+        conn.execute(
+            """
+            INSERT INTO sample_seal_events (sample_id, action, reason, created_at)
+            SELECT sample_id, 'sealed', reason, sealed_at FROM sample_seals
+            WHERE sample_id = ?
+            """,
+            (batch_id,),
+        )
+        conn.commit()
+    except HTTPException:
+        raise
+
+    return _build_seal_status_out(conn, batch_id, row["name"])
+
+
+@app.post(
+    "/batches/{batch_id}/unseal",
+    response_model=SealStatusOut,
+    summary="解除原始样本封存（记录原因与时间；未封存时 409，解除后可再次制备）",
+)
+def unseal_sample(
+    batch_id: int,
+    payload: SealRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> SealStatusOut:
+    row = _fetch_batch(conn, batch_id)
+    if row is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {batch_id}")
+    if row["kind"] != "sample":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"只有原始样本可解除封存（kind='sample'）: {batch_id}",
+        )
+
+    # 与封存共用同一写事务模型：解除封存与并发制备相互串行，提交后制备立即放行
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT 1 FROM sample_seals WHERE sample_id = ?", (batch_id,)
+        ).fetchone()
+        if existing is None:
+            # 当前并非封存状态：重复解除返回 409，不新增流水
+            conn.rollback()
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={"message": "原始样本未处于封存状态", "sealed_samples": []},
+            )
+        conn.execute("DELETE FROM sample_seals WHERE sample_id = ?", (batch_id,))
+        conn.execute(
+            "INSERT INTO sample_seal_events (sample_id, action, reason) VALUES (?, 'unsealed', ?)",
+            (batch_id, payload.reason),
+        )
+        conn.commit()
+    except HTTPException:
+        raise
+
+    return _build_seal_status_out(conn, batch_id, row["name"])
+
+
+@app.get(
+    "/batches/{batch_id}/seal",
+    response_model=SealStatusOut,
+    summary="查询原始样本封存状态与全部状态变更历史",
+)
+def get_seal_status(
+    batch_id: int, conn: sqlite3.Connection = Depends(get_db)
+) -> SealStatusOut:
+    row = _fetch_batch(conn, batch_id)
+    if row is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {batch_id}")
+    if row["kind"] != "sample":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"只有原始样本有封存状态（kind='sample'）: {batch_id}",
+        )
+    return _build_seal_status_out(conn, batch_id, row["name"])
+
+
 def _build_preparation_out(
     conn: sqlite3.Connection, prep: sqlite3.Row
 ) -> PreparationOut:
@@ -894,6 +1054,45 @@ def _ensure_inventory(conn: sqlite3.Connection, required: dict[int, int]) -> Non
     )
 
 
+def _ensure_not_sealed(conn: sqlite3.Connection, required: dict[int, int]) -> None:
+    """在制备写事务内拦截被封存的上游原始样本。
+
+    required 的键即沿配方图展开后本次（单批或整单汇总）会消耗的全部原始样本
+    （原始样本目标含自身）。其中任一处于封存中即回滚当前事务并抛 409：
+    detail.sealed_samples 按样本 id 升序给出全部命中封存的样本；本检查在库存
+    核算之前执行，命中时整次请求不扣库存、不写制备记录。
+    """
+    sample_ids = sorted(required)
+    sealed_rows = (
+        conn.execute(
+            """
+            SELECT ss.sample_id, b.name AS sample_name
+            FROM sample_seals ss
+            JOIN batches b ON b.id = ss.sample_id
+            WHERE ss.sample_id IN (%s)
+            ORDER BY ss.sample_id
+            """
+            % ", ".join("?" for _ in sample_ids),
+            sample_ids,
+        ).fetchall()
+        if sample_ids
+        else []
+    )
+    if not sealed_rows:
+        return
+    conn.rollback()
+    raise HTTPException(
+        status.HTTP_409_CONFLICT,
+        detail={
+            "message": "上游原始样本已封存，禁止制备",
+            "sealed_samples": [
+                {"sample_id": r["sample_id"], "sample_name": r["sample_name"]}
+                for r in sealed_rows
+            ],
+        },
+    )
+
+
 @app.post(
     "/batches/{batch_id}/preparations",
     response_model=PreparationOut,
@@ -918,6 +1117,10 @@ def create_preparation(
         # 原始样本目标直接消耗自身（每制备一次 1 份）
         required = preparation_requirements(conn, batch_id, payload.times)
         sample_ids = sorted(required)
+
+        # 封存检查先于库存核算：任一上游原始样本封存即整体回滚，
+        # 不扣库存、不写制备记录（与封存状态变更共用同一写事务，不会漏拦）
+        _ensure_not_sealed(conn, required)
 
         # 任一样本库存不足即整体回滚：库存与制备记录均不变化
         _ensure_inventory(conn, required)
@@ -1132,6 +1335,10 @@ def create_preparation_job(
         for batch_id in ids:
             for sample_id, portions in per_batch[batch_id].items():
                 total[sample_id] = total.get(sample_id, 0) + portions
+
+        # 封存检查沿汇总后的全部上游原始样本进行：任一命中即整单回滚，
+        # 不扣库存、不写任何制备记录；解除封存后可原样重试
+        _ensure_not_sealed(conn, total)
 
         # 任一样本不足：整单回滚，不留任何制备记录、余额不变
         _ensure_inventory(conn, total)

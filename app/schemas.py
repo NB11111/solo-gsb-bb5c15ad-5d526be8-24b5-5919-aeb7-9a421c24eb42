@@ -4,7 +4,7 @@ from __future__ import annotations
 from fractions import Fraction
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # 严格的正整数：拒绝 0、负数、浮点数（如 1.5 / 2.0）与字符串（如 "3"）
 StrictPositiveInt = Annotated[int, Field(strict=True, gt=0)]
@@ -224,6 +224,37 @@ class InventoryOut(BaseModel):
     sample_name: str
     balance: int     # 当前库存余额（份），未补入过的原始样本为 0
     updated_at: str | None = None  # 最近一次补入时间；从未补入时为 null
+
+
+class SealRequest(BaseModel):
+    """封存 / 解除封存原始样本时必须给出本次状态变更原因。"""
+
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_must_not_be_blank(cls, value: str) -> str:
+        # 纯空白原因无追溯意义，与空字符串一并拒绝（422）
+        if not value.strip():
+            raise ValueError("原因不能为空或纯空白")
+        return value
+
+
+class SealEventOut(BaseModel):
+    """一次封存状态变更：动作（sealed 封存 / unsealed 解除封存）、原因与时间。"""
+
+    action: Literal["sealed", "unsealed"]
+    reason: str
+    created_at: str
+
+
+class SealStatusOut(BaseModel):
+    sample_id: int
+    sample_name: str
+    sealed: bool  # 当前是否封存中；从未封存过为 false
+    reason: str | None = None        # 当前封存原因（仅 sealed=true 时有值）
+    sealed_at: str | None = None     # 最近一次封存时间（仅 sealed=true 时有值）
+    history: list[SealEventOut]      # 全部状态变更，按时间（事件 id）升序
 
 
 class PreparationCreateRequest(BaseModel):
